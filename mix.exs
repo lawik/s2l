@@ -14,7 +14,10 @@ defmodule S2l.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       name: "S2l",
-      description: "TODO: write a proper description",
+      description:
+        "Turns live audio into colour. Beat, onset and spectral analysis through " <>
+          "an aubio NIF, a Membrane element to drive it, and palette-based mapping " <>
+          "onto LED strips of any length.",
       docs: docs(),
       package: package(),
       aliases: aliases(),
@@ -41,7 +44,7 @@ defmodule S2l.MixProject do
       name: :s2l,
       licenses: ["GPL-3.0-or-later"],
       files: ~w(lib c_src Makefile mix.exs README.md LICENSE.md CHANGELOG.md .formatter.exs),
-      links: %{"GitHub" => "https://github.com/TODO/s2l"}
+      links: %{"GitHub" => "https://github.com/lawik/s2l"}
     ]
   end
 
