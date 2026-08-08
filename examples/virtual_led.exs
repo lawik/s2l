@@ -5,12 +5,15 @@
 # Opens http://localhost:4000 with a graphic equalizer, peak-hold caps, a
 # scrolling waterfall, and switchable palettes, all driven by the microphone.
 #
-# The interesting part is what this file *does not* contain: no analysis, no
-# smoothing, no colour decisions. Those all live in `S2l.ColorMapper` and
-# `S2l.Palette`, neither of which knows anything about Phoenix. This script is
-# the disposable half — the same frames it renders as div backgrounds are what
-# will drive real LEDs, so tuning done here against a browser is not thrown
-# away.
+# The interesting part is what this file does *not* contain. There is no
+# analysis here, no smoothing, no colour decisions, and no arithmetic mapping
+# bands onto pixels. Every one of those lives in the library — `S2l.ColorMapper`
+# and `S2l.Strip` — and none of them knows Phoenix exists. What is left below is
+# a pipeline definition, some CSS, and a loop turning `{r, g, b}` into style
+# attributes.
+#
+# That is the point: driving real LEDs with fledex means keeping the calls to
+# `S2l.Strip` and throwing this file away.
 
 Mix.install([
   {:s2l, path: Path.expand("..", __DIR__)},
@@ -51,6 +54,7 @@ defmodule VirtualLed.Live do
 
   alias S2l.ColorMapper
   alias S2l.Palette
+  alias S2l.Strip
 
   @leds 48
   @waterfall_rows 40
@@ -60,53 +64,57 @@ defmodule VirtualLed.Live do
   def mount(_params, _session, socket) do
     if connected?(socket), do: ColorMapper.subscribe()
 
-    # The first, disconnected render has no subscription yet, so it derives
-    # what it can from the mapper directly. History means a tab opened
-    # mid-song draws a full waterfall immediately instead of an empty one that
-    # fills in over the next few seconds.
-    frame = ColorMapper.frame()
-
+    # History means a tab opened mid-song draws a full waterfall immediately
+    # rather than an empty one that fills in over the next few seconds.
     {:ok,
      socket
-     |> assign(palette: :rainbow, mode: :spectrum, frame: frame)
-     # Counts travel as assigns because inside ~H a module attribute name is
-     # read as an assign, so @leds in the template would be the list, not 48.
-     |> assign(bar_count: @leds, col_count: @waterfall_cols)
-     |> assign(bars: spread(frame.bands, @leds), caps: spread(frame.peaks, @leds))
-     |> assign(rows: Enum.take(ColorMapper.history(), @waterfall_rows))}
+     |> assign(palette: :rainbow, color_by: :position)
+     |> paint(ColorMapper.frame(), Enum.take(ColorMapper.history(), @waterfall_rows))}
   end
 
   @impl true
   def handle_info({:s2l_frame, frame}, socket) do
-    rows = [frame | socket.assigns.rows] |> Enum.take(@waterfall_rows)
+    rows = Enum.take([frame | socket.assigns.rows], @waterfall_rows)
 
-    {:noreply,
-     socket
-     |> assign(frame: frame, rows: rows)
-     |> assign(bars: spread(frame.bands, @leds), caps: spread(frame.peaks, @leds))}
+    {:noreply, paint(socket, frame, rows)}
   end
 
   @impl true
   def handle_event("palette", %{"name" => name}, socket) do
-    {:noreply, assign(socket, palette: String.to_existing_atom(name))}
+    socket = assign(socket, palette: String.to_existing_atom(name))
+
+    {:noreply, paint(socket, socket.assigns.frame, socket.assigns.rows)}
   end
 
-  def handle_event("mode", %{"name" => name}, socket) do
-    {:noreply, assign(socket, mode: String.to_existing_atom(name))}
+  def handle_event("color_by", %{"name" => name}, socket) do
+    socket = assign(socket, color_by: String.to_existing_atom(name))
+
+    {:noreply, paint(socket, socket.assigns.frame, socket.assigns.rows)}
   end
 
-  # Stretches however many analysis bands there are across however many LEDs
-  # are being drawn, so the strip length and the band count stay independent.
-  # This is the same mapping a real strip will need.
-  defp spread([], count), do: List.duplicate(0.0, count)
+  # The only place this file touches colour, and it does so entirely by asking
+  # the library. Bar heights come from the frame's own band levels resampled to
+  # the strip length; everything else is a call to S2l.Strip.
+  defp paint(socket, frame, rows) do
+    opts = [palette: socket.assigns.palette, color_by: socket.assigns.color_by]
 
-  defp spread(values, count) do
-    source = List.to_tuple(values)
-    size = tuple_size(source)
-
-    Enum.map(0..(count - 1), fn index ->
-      elem(source, min(div(index * size, count), size - 1))
-    end)
+    assign(socket,
+      frame: frame,
+      rows: rows,
+      # Zipped into one list per bar so the template iterates once rather than
+      # indexing into four parallel lists.
+      bars:
+        Enum.zip([
+          Strip.resample(frame.bands, @leds),
+          Strip.render(frame, @leds, opts),
+          Strip.resample(frame.peaks, @leds),
+          # floor: 1.0 pins caps to full brightness, so they stay legible
+          # against the bar they are sitting on.
+          Strip.render(frame, @leds, [source: :peaks, floor: 1.0] ++ opts)
+        ]),
+      wash: Strip.wash(frame, [floor: 0.04, gain: 0.35] ++ opts),
+      waterfall: Strip.waterfall(rows, @waterfall_cols, opts)
+    )
   end
 
   @impl true
@@ -144,7 +152,7 @@ defmodule VirtualLed.Live do
       .beat { color: #fff; font-weight: 700; }
     </style>
 
-    <div class="stage" style={"background-color: #{wash(@frame, @palette, @mode)}"}>
+    <div class="stage" style={"background-color: #{Palette.hex(@wash)}"}>
       <div class="controls">
         <div class="group">
           <b>PALETTE</b>
@@ -153,28 +161,28 @@ defmodule VirtualLed.Live do
         </div>
         <div class="group">
           <b>COLOUR BY</b>
-          <button :for={{name, label} <- [spectrum: "position", pitch: "pitch", level: "level"]}
-                  phx-click="mode" phx-value-name={name}
-                  class={if name == @mode, do: "on"}>{label}</button>
+          <button :for={name <- [:position, :pitch, :centroid, :level]}
+                  phx-click="color_by" phx-value-name={name}
+                  class={if name == @color_by, do: "on"}>{name}</button>
         </div>
       </div>
 
       <div class="middle">
         <div class="strip">
-          <div :for={{level, i} <- Enum.with_index(@bars)} class="bar">
+          <div :for={{height, colour, cap_height, cap_colour} <- @bars} class="bar">
             <div class="fill"
-                 style={"height: #{round(level * 100)}%; background-color: #{led(@frame, @palette, @mode, level, i, @bar_count)}"}>
+                 style={"height: #{round(height * 100)}%; background-color: #{Palette.hex(colour)}"}>
             </div>
             <div class="cap"
-                 style={"bottom: calc(#{round(Enum.at(@caps, i, 0.0) * 100)}% - 1px); background-color: #{cap(@frame, @palette, @mode, i, @bar_count)}"}>
+                 style={"bottom: calc(#{round(cap_height * 100)}% - 1px); background-color: #{Palette.hex(cap_colour)}"}>
             </div>
           </div>
         </div>
 
         <div class="waterfall">
-          <div :for={row <- @rows} class="row">
-            <div :for={{level, i} <- Enum.with_index(spread(row.bands, @col_count))} class="cell"
-                 style={"background-color: #{Palette.hex(Palette.at(@palette, position(row, @mode, i, @col_count), brightness: level))}"}>
+          <div :for={row <- @waterfall} class="row">
+            <div :for={colour <- row} class="cell"
+                 style={"background-color: #{Palette.hex(colour)}"}>
             </div>
           </div>
         </div>
@@ -189,49 +197,6 @@ defmodule VirtualLed.Live do
       </div>
     </div>
     """
-  end
-
-  # Where in the palette a given bar sits. This is the whole difference between
-  # the three modes, and worth understanding before tuning anything:
-  #
-  #   :spectrum — position along the strip *is* frequency, so the top end always
-  #     has a colour of its own. The graphic-equalizer mapping WLED and friends
-  #     use, and the only one of the three that can distinguish a cymbal from a
-  #     bass note at a glance.
-  #   :pitch — the whole strip takes its colour from the dominant frequency, so
-  #     colour tracks the melody instead of the spectrum.
-  #   :level — colour follows loudness, ignoring frequency entirely.
-  defp position(frame, mode, index, count)
-  defp position(_frame, :spectrum, index, count), do: index / max(count - 1, 1)
-  defp position(frame, :pitch, _index, _count), do: frame.pitch
-  defp position(frame, :level, _index, _count), do: frame.level
-
-  defp led(frame, palette, mode, level, index, count) do
-    # Brightness is that band's own energy, lifted by the overall level so the
-    # strip breathes rather than just twitching.
-    brightness = 0.25 + 0.75 * level * (0.4 + 0.6 * frame.level)
-
-    palette
-    |> Palette.at(position(frame, mode, index, count), brightness: brightness)
-    |> Palette.hex()
-  end
-
-  defp cap(frame, palette, mode, index, count) do
-    palette
-    |> Palette.at(position(frame, mode, index, count), brightness: 1.0)
-    |> Palette.hex()
-  end
-
-  # One colour for the whole mix, kept dark so it cannot drown the strip. This
-  # is the averaged-hue approach: useful as a backdrop, but on its own it
-  # cannot tell a cymbal from a bass note, because a spectral average over
-  # broadband audio barely moves.
-  defp wash(frame, palette, mode) do
-    palette
-    |> Palette.at(position(frame, mode, 0, 1) * 0.5 + frame.centroid * 0.5,
-      brightness: 0.05 + frame.level * 0.12
-    )
-    |> Palette.hex()
   end
 end
 

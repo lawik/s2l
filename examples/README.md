@@ -67,8 +67,12 @@ The background wash is the averaged-hue approach — one colour for the whole
 mix. Useful as a backdrop, but on its own it cannot distinguish a cymbal from a
 bass note, because a spectral average over broadband audio barely moves.
 
-The point of this one is what it *doesn't* do. There is no analysis and no
-colour logic in the script: it subscribes to frames and turns them into CSS.
+The point of this one is what it *doesn't* do. Every decision — analysis,
+smoothing, colour, and the arithmetic fitting bands onto pixels — is a call
+into `S2l.ColorMapper`, `S2l.Palette` and `S2l.Strip`. What is left is a
+pipeline definition, some CSS, and a loop turning `{r, g, b}` into style
+attributes. Driving real LEDs means keeping the `S2l.Strip` calls and throwing
+the rest away.
 Everything that decides colour lives in `S2l.ColorMapper`, which has no
 knowledge of Phoenix, so the tuning you do here against a browser is the same
 tuning that will drive real LEDs. Kill the browser tab and the frames keep

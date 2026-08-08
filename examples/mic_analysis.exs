@@ -19,31 +19,35 @@ Logger.configure(level: :warning)
 
 defmodule MicAnalysis.Reporter do
   @moduledoc """
-  Redraws a single terminal line from the analysis stream.
+  Redraws a single terminal line from the colour mapper's frames.
 
-  A `GenServer` rather than raw `IO.puts` from the pipeline: analysis arrives
-  about 86 times a second, which is far more often than a terminal can usefully
-  be redrawn, so this throttles to something readable.
+  Counting beats and onsets is the only state kept here, and only because it is
+  a property of this display rather than of the audio. Levels, automatic gain
+  and pacing all come from `S2l.ColorMapper`: analysis arrives about 86 times a
+  second in arbitrary units, and turning that into something bounded and steady
+  is exactly the job it already does.
   """
 
   use GenServer
 
-  @redraw_interval 50
   @bar_width 40
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, nil, name: __MODULE__)
   end
 
-  def report(analysis) do
+  @doc """
+  Counts an analysis. Levels come from the mapper, so only the tallies live here.
+  """
+  def count(analysis) do
     GenServer.cast(__MODULE__, {:analysis, analysis})
   end
 
   @impl GenServer
   def init(_arg) do
-    Process.send_after(self(), :redraw, @redraw_interval)
+    S2l.ColorMapper.subscribe()
 
-    {:ok, %{analysis: nil, peak: 0.0, beats: 0, onsets: 0, beat_flash: 0}}
+    {:ok, %{beats: 0, onsets: 0}}
   end
 
   @impl GenServer
@@ -51,38 +55,23 @@ defmodule MicAnalysis.Reporter do
     {:noreply,
      %{
        state
-       | analysis: analysis,
-         peak: max(Enum.sum(analysis.bands), state.peak * 0.999),
-         beats: state.beats + if(analysis.beat, do: 1, else: 0),
-         onsets: state.onsets + if(analysis.onset, do: 1, else: 0),
-         beat_flash: if(analysis.beat, do: 6, else: max(state.beat_flash - 1, 0))
+       | beats: state.beats + if(analysis.beat, do: 1, else: 0),
+         onsets: state.onsets + if(analysis.onset, do: 1, else: 0)
      }}
   end
 
+  # Frames arrive on the mapper's clock, which is already a sane redraw rate.
   @impl GenServer
-  def handle_info(:redraw, %{analysis: nil} = state) do
-    Process.send_after(self(), :redraw, @redraw_interval)
-
-    {:noreply, state}
-  end
-
-  def handle_info(:redraw, state) do
-    analysis = state.analysis
-    energy = Enum.sum(analysis.bands)
-    level = if state.peak > 0, do: energy / state.peak, else: 0.0
-    filled = round(level * @bar_width)
-
+  def handle_info({:s2l_frame, frame}, state) do
+    filled = round(frame.level * @bar_width)
     bar = String.duplicate("█", filled) <> String.duplicate("·", @bar_width - filled)
-    beat = if state.beat_flash > 0, do: "BEAT", else: "    "
 
     IO.write(
-      "\r#{bar} #{beat} " <>
-        "bpm #{:io_lib.format(~c"~6.1f", [analysis.bpm])} " <>
-        "conf #{:io_lib.format(~c"~5.2f", [analysis.confidence])} " <>
+      "\r#{bar} #{if frame.beat, do: "BEAT", else: "    "} " <>
+        "bpm #{:io_lib.format(~c"~6.1f", [frame.bpm])} " <>
+        "peak #{:io_lib.format(~c"~6.0f", [frame.peak_freq])} Hz " <>
         "beats #{state.beats} onsets #{state.onsets}  "
     )
-
-    Process.send_after(self(), :redraw, @redraw_interval)
 
     {:noreply, state}
   end
@@ -108,14 +97,25 @@ defmodule MicAnalysis.Pipeline do
         channels: 1,
         latency: :low
       })
-      |> child(:analyzer, %S2l.Membrane.Analyzer{
-        handler: &MicAnalysis.Reporter.report/1
-      })
+      |> child(:analyzer, %S2l.Membrane.Analyzer{handler: &MicAnalysis.handle/1})
 
     {[spec: spec], %{}}
   end
 end
 
+defmodule MicAnalysis do
+  @moduledoc """
+  Every hop goes to the colour mapper, which does the real work, and to the
+  reporter, which only tallies.
+  """
+
+  def handle(analysis) do
+    S2l.ColorMapper.push(analysis)
+    MicAnalysis.Reporter.count(analysis)
+  end
+end
+
+{:ok, _pid} = S2l.ColorMapper.start_link()
 {:ok, _pid} = MicAnalysis.Reporter.start_link([])
 {:ok, _supervisor, _pipeline} = Membrane.Pipeline.start_link(MicAnalysis.Pipeline)
 

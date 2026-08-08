@@ -48,6 +48,9 @@ both carry to a device unchanged:
   history buffer for waterfall displays.
 * `S2l.Palette` — position in, RGB out, with built-in palettes and support for
   your own.
+* `S2l.Strip` — fits a frame onto however many LEDs you have, and turns it into
+  a list of `{r, g, b}`. Band count and LED count are unrelated, so something
+  has to interpolate going up and aggregate going down; this is that something.
 
 `S2l.Membrane.Analyzer` is the Membrane sink that drives the whole thing from
 an audio stream. See `examples/` for both wired up.
