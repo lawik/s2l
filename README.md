@@ -40,6 +40,18 @@ Feed the analyzer one hop of `f32le` mono at a time, in order:
 stream's real sample rate to `create/2`; analyzing 48 kHz audio as 44.1 kHz
 reports a tempo about 9% off rather than failing.
 
+Two modules turn that into colour, neither of which depends on a framework, so
+both carry to a device unchanged:
+
+* `S2l.ColorMapper` — smooths analysis into paced frames carrying level, hue,
+  spectral centroid, dominant pitch, per-band levels, peak-hold caps and a
+  history buffer for waterfall displays.
+* `S2l.Palette` — position in, RGB out, with built-in palettes and support for
+  your own.
+
+`S2l.Membrane.Analyzer` is the Membrane sink that drives the whole thing from
+an audio stream. See `examples/` for both wired up.
+
 ## Native build
 
 The NIF is built with [elixir_make](https://hex.pm/packages/elixir_make):

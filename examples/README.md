@@ -44,6 +44,29 @@ The same pipeline, feeding `S2l.ColorMapper`, rendered by a
 [Phoenix Playground](https://hex.pm/packages/phoenix_playground) LiveView as a
 virtual LED strip over a background wash.
 
+On the page:
+
+* **Graphic equalizer** with **peak-hold caps**. Position along the strip *is*
+  frequency, colour comes from position, brightness is that band's energy.
+  Colour is never averaged, which is what gives the top end a colour of its own.
+  The caps sit at each band's recent maximum and fall steadily.
+* **Waterfall** underneath, scrolling downward — the last few seconds of
+  spectrum, built from `S2l.ColorMapper.history/1`. Because history lives in
+  the mapper rather than the view, opening a tab mid-song draws a full
+  waterfall immediately instead of an empty one that fills in.
+* **Palettes**, switchable live. See `S2l.Palette`.
+* **Colour by**, switchable live, which is the interesting comparison:
+  * `position` — the GEQ mapping described above.
+  * `pitch` — the whole strip takes its colour from the dominant frequency, so
+    colour follows the melody rather than the spectrum. This is what WLED's
+    Freqmap and Freqwave effects do.
+  * `level` — colour follows loudness alone, ignoring frequency. Included
+    mostly to show how much less it tells you.
+
+The background wash is the averaged-hue approach — one colour for the whole
+mix. Useful as a backdrop, but on its own it cannot distinguish a cymbal from a
+bass note, because a spectral average over broadband audio barely moves.
+
 The point of this one is what it *doesn't* do. There is no analysis and no
 colour logic in the script: it subscribes to frames and turns them into CSS.
 Everything that decides colour lives in `S2l.ColorMapper`, which has no

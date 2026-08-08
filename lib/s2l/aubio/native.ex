@@ -18,10 +18,21 @@ defmodule S2l.Aubio.Native do
           non_neg_integer(),
           non_neg_integer(),
           non_neg_integer(),
+          float(),
+          float(),
           binary(),
           binary()
         ) :: {:ok, reference()} | {:error, atom()}
-  def create(_sample_rate, _buf_size, _hop_size, _n_bands, _onset_method, _tempo_method) do
+  def create(
+        _sample_rate,
+        _buf_size,
+        _hop_size,
+        _n_bands,
+        _fmin,
+        _fmax,
+        _onset_method,
+        _tempo_method
+      ) do
     :erlang.nif_error(:nif_not_loaded)
   end
 

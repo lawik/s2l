@@ -24,8 +24,11 @@ defmodule S2l.ColorMapper do
 
   ## What it does
 
-  * **Hue** follows the spectral centre of mass: bass-heavy leans red, treble
-    leans blue. Smoothed, so it drifts rather than flickers.
+  * **Hue** follows the spectral centre of mass, stretched across the range that
+    centre actually occupies for the material playing. The raw centroid is an
+    energy-weighted mean, so for anything broadband it sits stubbornly near the
+    middle and mapping it directly paints everything a single colour. Adapting
+    to the observed range is what makes it move.
   * **Level** follows total energy through an automatic gain stage, so a quiet
     room and a loud one both use the full range. It rises fast and falls slowly,
     the way a VU meter does, because instant decay reads as flicker.
@@ -53,15 +56,29 @@ defmodule S2l.ColorMapper do
   * `:beat` — whether this frame lands on a beat.
   * `:bpm` — the tempo tracker's current estimate. Passed through untouched,
     and meaningless until it has had a few seconds to settle.
+  * `:centroid` — raw spectral centre of mass, 0.0–1.0, before any adaptation.
+    Use this to build your own colour mapping; `:hue` is one opinionated
+    reading of it.
   * `:bands` — per-band level, 0.0–1.0, low frequency first. For spatial
-    effects across an LED strip.
+    effects across an LED strip, and the better basis for colour if you want
+    the top end to have a colour of its own.
+  * `:peaks` — per-band peak hold, 0.0–1.0, falling steadily from each band's
+    recent maximum. The falling caps on a graphic equalizer.
+  * `:pitch` — position of the dominant frequency between `:pitch_range`, 0.0–1.0
+    on a log scale so octaves are evenly spaced. Holds its last value rather
+    than dropping out when there is no usable peak.
+  * `:peak_freq` — that dominant frequency in Hz, without any smoothing.
   """
   @type frame :: %{
           hue: float(),
           level: float(),
           beat: boolean(),
           bpm: float(),
-          bands: [float()]
+          centroid: float(),
+          pitch: float(),
+          peak_freq: float(),
+          bands: [float()],
+          peaks: [float()]
         }
 
   @type option ::
@@ -71,6 +88,12 @@ defmodule S2l.ColorMapper do
           | {:decay, float()}
           | {:hue_smoothing, float()}
           | {:hue_range, {number(), number()}}
+          | {:hue_adapt, float()}
+          | {:hue_min_span, float()}
+          | {:pitch_range, {number(), number()}}
+          | {:pitch_smoothing, float()}
+          | {:peak_decay, float()}
+          | {:history, non_neg_integer()}
           | {:beat_boost, float()}
           | {:beat_decay, float()}
           | {:gain_decay, float()}
@@ -86,6 +109,17 @@ defmodule S2l.ColorMapper do
     # Red through to blue. Stopping short of 360 avoids wrapping back to red at
     # the treble end, which would make the two extremes indistinguishable.
     hue_range: {0.0, 260.0},
+    # How fast the observed centroid range closes back in, per analysis. At
+    # roughly 86 analyses a second this is a window of a few seconds.
+    hue_adapt: 0.004,
+    hue_min_span: 0.1,
+    # The dominant peak hops between partials constantly, so it needs heavier
+    # smoothing than anything derived from the bands.
+    pitch_range: {40.0, 12_000.0},
+    pitch_smoothing: 0.15,
+    # Per frame, so a cap falls to the floor in about a second at 30 fps.
+    peak_decay: 0.03,
+    history: 90,
     beat_boost: 0.45,
     beat_decay: 0.35,
     # Slow enough to hold a reference through a quiet passage, fast enough to
@@ -145,11 +179,25 @@ defmodule S2l.ColorMapper do
   * `:decay` — how fast level falls (default `#{@defaults.decay}`).
   * `:hue_smoothing` — how fast hue chases the spectrum (default `#{@defaults.hue_smoothing}`).
   * `:hue_range` — `{bass_hue, treble_hue}` (default `#{inspect(@defaults.hue_range)}`).
+  * `:hue_adapt` — how fast the observed centroid range closes back in, per
+    analysis (default `#{@defaults.hue_adapt}`). Higher reacts sooner to a
+    change of material but makes steady music drift back to the middle.
+  * `:hue_min_span` — narrowest centroid range that will be stretched over the
+    full hue range (default `#{@defaults.hue_min_span}`). Raising it makes
+    colour calmer; lowering it amplifies small spectral movements.
   * `:beat_boost` — brightness added on a beat (default `#{@defaults.beat_boost}`).
   * `:beat_decay` — how fast that spike fades (default `#{@defaults.beat_decay}`).
   * `:gain_decay` — how fast the automatic gain reference falls
     (default `#{@defaults.gain_decay}`). Lower adapts faster and pumps more.
   * `:gate` — energy below this counts as silence (default `#{@defaults.gate}`).
+  * `:pitch_range` — `{low_hz, high_hz}` spanned by `:pitch`
+    (default `#{inspect(@defaults.pitch_range)}`).
+  * `:pitch_smoothing` — how fast `:pitch` chases the dominant frequency
+    (default `#{@defaults.pitch_smoothing}`).
+  * `:peak_decay` — how far a peak-hold cap falls per frame
+    (default `#{@defaults.peak_decay}`).
+  * `:history` — frames retained for `history/1` (default `#{@defaults.history}`,
+    three seconds at the default rate). `0` disables it.
   """
   @spec configure(GenServer.server(), [option()]) :: :ok
   def configure(server \\ __MODULE__, opts) do
@@ -164,6 +212,23 @@ defmodule S2l.ColorMapper do
     GenServer.call(server, :frame)
   end
 
+  @doc """
+  The most recent frames, newest first.
+
+  Retains up to the `:history` option's worth. This is what a waterfall or
+  scrolling spectrogram is built from: each entry is one row, and `:bands` is
+  that row's column heights.
+
+  Kept here rather than left to each consumer so that something attaching
+  mid-song — a browser tab opening, an animation restarting — gets a full
+  display immediately instead of an empty one that fills in over the next few
+  seconds.
+  """
+  @spec history(GenServer.server()) :: [frame()]
+  def history(server \\ __MODULE__) do
+    GenServer.call(server, :history)
+  end
+
   @impl GenServer
   def init(opts) do
     state = %{
@@ -172,10 +237,17 @@ defmodule S2l.ColorMapper do
       hue: 0.0,
       spike: 0.0,
       bpm: 0.0,
+      centroid: 0.5,
+      centroid_min: nil,
+      centroid_max: nil,
+      pitch: 0.0,
+      peak_freq: 0.0,
       beat_pending: false,
       energy_peak: 0.0,
       band_peak: 0.0,
       bands: [],
+      peaks: [],
+      history: [],
       subscribers: %{}
     }
 
@@ -211,6 +283,10 @@ defmodule S2l.ColorMapper do
     {:reply, build_frame(state), state}
   end
 
+  def handle_call(:history, _from, state) do
+    {:reply, state.history, state}
+  end
+
   @impl GenServer
   def handle_info(:tick, state) do
     state = advance(state)
@@ -220,6 +296,8 @@ defmodule S2l.ColorMapper do
     for {_ref, pid} <- state.subscribers do
       send(pid, {:s2l_frame, frame})
     end
+
+    state = %{state | history: Enum.take([frame | state.history], state.config.history)}
 
     {:noreply, schedule_tick(state)}
   end
@@ -257,16 +335,60 @@ defmodule S2l.ColorMapper do
 
     rate = if target > state.level, do: config.attack, else: config.decay
 
-    %{
+    state = %{
       state
       | level: state.level + (target - state.level) * rate,
-        hue: state.hue + (target_hue(analysis.bands, config) - state.hue) * config.hue_smoothing,
         bpm: analysis.bpm,
         energy_peak: energy_peak,
         band_peak: band_peak,
         bands: normalize_bands(analysis.bands, band_peak, config),
         beat_pending: state.beat_pending or analysis.beat
     }
+
+    state = absorb_pitch(state, analysis, config)
+
+    case spectral_centroid(analysis.bands, config) do
+      nil ->
+        state
+
+      centroid ->
+        state = adapt_range(state, centroid, config)
+        target_hue = hue_for(centroid, state, config)
+
+        %{
+          state
+          | centroid: centroid,
+            hue: state.hue + (target_hue - state.hue) * config.hue_smoothing
+        }
+    end
+  end
+
+  # A frame with no usable peak holds the last pitch rather than snapping to
+  # the bottom of the range, which would read as a hard colour change every
+  # time the music left a gap.
+  defp absorb_pitch(state, analysis, config) do
+    case pitch_position(analysis.peak_freq, config) do
+      nil ->
+        state
+
+      position ->
+        %{
+          state
+          | pitch: state.pitch + (position - state.pitch) * config.pitch_smoothing,
+            peak_freq: analysis.peak_freq
+        }
+    end
+  end
+
+  # Log scaled, so an octave covers the same distance wherever it falls. On a
+  # linear scale everything below a few kHz would be squeezed into the bottom
+  # of the range, which is where most music actually lives.
+  defp pitch_position(freq, config) do
+    {low, high} = config.pitch_range
+
+    if freq > low and high > low do
+      clamp(:math.log(freq / low) / :math.log(high / low), 0.0, 1.0)
+    end
   end
 
   # Runs once per output frame, on the clock.
@@ -278,7 +400,23 @@ defmodule S2l.ColorMapper do
         state.spike * state.config.beat_decay
       end
 
-    %{state | spike: spike, beat_pending: false}
+    %{state | spike: spike, beat_pending: false, peaks: hold_peaks(state)}
+  end
+
+  # Each cap sits at its band's recent maximum and falls a fixed amount per
+  # frame. Decaying here rather than on each analysis keeps the fall rate tied
+  # to what is displayed, not to the audio hop rate.
+  defp hold_peaks(state) do
+    peaks =
+      if length(state.peaks) == length(state.bands) do
+        state.peaks
+      else
+        List.duplicate(0.0, length(state.bands))
+      end
+
+    Enum.zip_with(state.bands, peaks, fn band, peak ->
+      max(band, peak - state.config.peak_decay)
+    end)
   end
 
   defp build_frame(state) do
@@ -287,15 +425,20 @@ defmodule S2l.ColorMapper do
       level: clamp(state.level + state.spike * state.config.beat_boost, 0.0, 1.0),
       beat: state.spike > 0.5,
       bpm: state.bpm,
-      bands: state.bands
+      centroid: state.centroid,
+      pitch: state.pitch,
+      peak_freq: state.peak_freq,
+      bands: state.bands,
+      peaks: state.peaks
     }
   end
 
-  # Spectral centre of mass, as a position between the lowest and highest band,
-  # mapped onto the hue range. Mel spacing means this tracks what a listener
-  # would call "brightness" rather than raw frequency.
-  defp target_hue(bands, config) do
-    {low, high} = config.hue_range
+  # Spectral centre of mass, as a position between the lowest and highest band.
+  # Mel spacing means this tracks what a listener would call brightness rather
+  # than raw frequency. Silence gets no opinion rather than a centroid of zero,
+  # which would otherwise drag the adaptive range below towards the bass end
+  # every time the music stopped.
+  defp spectral_centroid(bands, config) do
     total = Enum.sum(bands)
 
     if total > config.gate do
@@ -304,12 +447,44 @@ defmodule S2l.ColorMapper do
         |> Enum.with_index()
         |> Enum.reduce(0.0, fn {value, index}, acc -> acc + value * index end)
 
-      centroid = weighted / total / max(length(bands) - 1, 1)
-
-      low + (high - low) * clamp(centroid, 0.0, 1.0)
-    else
-      low
+      clamp(weighted / total / max(length(bands) - 1, 1), 0.0, 1.0)
     end
+  end
+
+  # The centroid is an energy-weighted mean, so anything broadband — which is
+  # to say all music — pins it near the middle of the range. Mapping it
+  # straight onto hue therefore paints everything one colour, in practice a
+  # green. What carries information is where the centroid sits *relative to
+  # this material*, so the range it actually occupies is tracked and stretched
+  # across the hue range instead.
+  defp adapt_range(state, centroid, config) do
+    low = min(centroid, state.centroid_min || centroid)
+    high = max(centroid, state.centroid_max || centroid)
+
+    # New extremes are taken immediately; the window closes back in slowly, so
+    # one cymbal crash does not widen it for the rest of the session.
+    %{
+      state
+      | centroid_min: low + (centroid - low) * config.hue_adapt,
+        centroid_max: high + (centroid - high) * config.hue_adapt
+    }
+  end
+
+  # Always called on state that has just been through adapt_range/3, so the
+  # observed window is populated.
+  defp hue_for(centroid, %{centroid_min: observed_min, centroid_max: observed_max}, config) do
+    {low, high} = config.hue_range
+
+    # Widened around the middle of the observed window rather than from its
+    # bottom, so material with no spectral variation lands mid-range instead of
+    # being pinned to one end of the palette on no evidence. The floor also
+    # stops a nearly constant centroid being amplified into a full rainbow of
+    # meaningless movement.
+    centre = (observed_min + observed_max) / 2
+    half = max(observed_max - observed_min, config.hue_min_span) / 2
+    position = clamp((centroid - (centre - half)) / (2 * half), 0.0, 1.0)
+
+    low + (high - low) * position
   end
 
   defp normalize_bands(bands, band_peak, config) do

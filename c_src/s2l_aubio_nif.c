@@ -39,6 +39,8 @@ static ERL_NIF_TERM atom_bpm;
 static ERL_NIF_TERM atom_confidence;
 static ERL_NIF_TERM atom_onset;
 static ERL_NIF_TERM atom_bands;
+static ERL_NIF_TERM atom_peak_freq;
+static ERL_NIF_TERM atom_peak_magnitude;
 
 typedef struct {
     /* aubio state is not reentrant and a resource is shareable across
@@ -57,6 +59,9 @@ typedef struct {
     fvec_t *scratch;
     unsigned int hop_size;
     unsigned int n_bands;
+    /* Kept so the dominant peak can be reported in Hz rather than as a bin. */
+    unsigned int buf_size;
+    unsigned int sample_rate;
 } s2l_analyzer;
 
 static void s2l_analyzer_free(s2l_analyzer *a)
@@ -114,6 +119,58 @@ static ERL_NIF_TERM s2l_make_double(ErlNifEnv *env, double value)
     return enif_make_double(env, isfinite(value) ? value : 0.0);
 }
 
+/* Loudest bin of the magnitude spectrum, in Hz.
+ *
+ * The bin index alone is too coarse to drive colour: at a 1024 window and
+ * 48 kHz the bins are ~47 Hz apart, so a steady note would visibly quantise as
+ * it drifted between them. Fitting a parabola through the peak and its two
+ * neighbours recovers a fractional bin, which is the standard trick and costs
+ * three multiplies.
+ *
+ * Writes the interpolated magnitude to *magnitude and returns the frequency,
+ * or 0.0 when the frame carries nothing worth pointing at. */
+static double s2l_peak_frequency(const s2l_analyzer *a, double *magnitude)
+{
+    const cvec_t *spectrum = a->spectrum;
+    unsigned int last = spectrum->length - 1;
+    unsigned int peak = 0;
+    smpl_t best = 0.0f;
+
+    /* Bin 0 is DC and the final bin has no right-hand neighbour to fit
+     * against; neither is a musically meaningful answer anyway. */
+    for (unsigned int i = 1; i < last; i++) {
+        if (spectrum->norm[i] > best) {
+            best = spectrum->norm[i];
+            peak = i;
+        }
+    }
+
+    if (peak == 0 || best <= 0.0f) {
+        *magnitude = 0.0;
+        return 0.0;
+    }
+
+    double left = spectrum->norm[peak - 1];
+    double centre = spectrum->norm[peak];
+    double right = spectrum->norm[peak + 1];
+    double denominator = left - 2.0 * centre + right;
+    double offset = 0.0;
+
+    /* A flat or upward-curving triple has no parabolic vertex to find, so the
+     * bin centre stands. */
+    if (denominator < 0.0) {
+        offset = 0.5 * (left - right) / denominator;
+
+        if (offset > 0.5 || offset < -0.5) {
+            offset = 0.0;
+        }
+    }
+
+    *magnitude = centre - 0.25 * (left - right) * offset;
+
+    return (peak + offset) * (double)a->sample_rate / (double)a->buf_size;
+}
+
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
     (void)priv_data;
@@ -138,6 +195,8 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     atom_confidence = enif_make_atom(env, "confidence");
     atom_onset = enif_make_atom(env, "onset");
     atom_bands = enif_make_atom(env, "bands");
+    atom_peak_freq = enif_make_atom(env, "peak_freq");
+    atom_peak_magnitude = enif_make_atom(env, "peak_magnitude");
 
     return 0;
 }
@@ -145,6 +204,7 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     unsigned int sample_rate, buf_size, hop_size, n_bands;
+    double fmin, fmax;
     ErlNifBinary tempo_method, onset_method;
     char tempo_name[S2L_MAX_METHOD_LEN + 1];
     char onset_name[S2L_MAX_METHOD_LEN + 1];
@@ -153,8 +213,9 @@ static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 
     if (!enif_get_uint(env, argv[0], &sample_rate) || !enif_get_uint(env, argv[1], &buf_size) ||
         !enif_get_uint(env, argv[2], &hop_size) || !enif_get_uint(env, argv[3], &n_bands) ||
-        !enif_inspect_binary(env, argv[4], &onset_method) ||
-        !enif_inspect_binary(env, argv[5], &tempo_method)) {
+        !enif_get_double(env, argv[4], &fmin) || !enif_get_double(env, argv[5], &fmax) ||
+        !enif_inspect_binary(env, argv[6], &onset_method) ||
+        !enif_inspect_binary(env, argv[7], &tempo_method)) {
         return s2l_error(env, atom_badarg);
     }
 
@@ -165,6 +226,12 @@ static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         n_bands > S2L_MAX_BANDS || onset_method.size == 0 ||
         onset_method.size > S2L_MAX_METHOD_LEN || tempo_method.size == 0 ||
         tempo_method.size > S2L_MAX_METHOD_LEN) {
+        return s2l_error(env, atom_badarg);
+    }
+
+    /* Filters above Nyquist would be built from coefficients that alias, and an
+     * inverted or empty range yields a filterbank of zeros with no complaint. */
+    if (!(fmin >= 0.0) || !(fmax > fmin) || fmax > sample_rate / 2.0) {
         return s2l_error(env, atom_badarg);
     }
 
@@ -182,6 +249,8 @@ static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     memset(a, 0, sizeof(*a));
     a->hop_size = hop_size;
     a->n_bands = n_bands;
+    a->buf_size = buf_size;
+    a->sample_rate = sample_rate;
 
     a->lock = enif_mutex_create("s2l_analyzer");
     a->tempo = new_aubio_tempo(tempo_name, buf_size, hop_size, sample_rate);
@@ -200,11 +269,11 @@ static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         return s2l_error(env, atom_init_failed);
     }
 
-    /* Mel bands across the full range, so the spread carries real color
-     * information from bass to treble. Nyquist comes from the caller's rate;
-     * hardcoding it is exactly the mismatch that skews everything downstream. */
-    if (aubio_filterbank_set_mel_coeffs(a->filterbank, (smpl_t)sample_rate, 0.0f,
-                                        (smpl_t)sample_rate / 2.0f) != 0) {
+    /* Mel-spaced bands over the caller's frequency range. Spending bands on
+     * 12-24 kHz, where music has almost no energy, wastes most of the top of
+     * the spread and drags any statistic computed over it. */
+    if (aubio_filterbank_set_mel_coeffs(a->filterbank, (smpl_t)sample_rate, (smpl_t)fmin,
+                                        (smpl_t)fmax) != 0) {
         enif_release_resource(a);
         return s2l_error(env, atom_init_failed);
     }
@@ -254,6 +323,8 @@ static ERL_NIF_TERM s2l_process(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     int onset = a->onset_out->data[0] != 0;
     double bpm = aubio_tempo_get_bpm(a->tempo);
     double confidence = aubio_tempo_get_confidence(a->tempo);
+    double peak_magnitude = 0.0;
+    double peak_freq = s2l_peak_frequency(a, &peak_magnitude);
 
     ERL_NIF_TERM bands = enif_make_list(env, 0);
 
@@ -263,13 +334,19 @@ static ERL_NIF_TERM s2l_process(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
     enif_mutex_unlock(a->lock);
 
-    ERL_NIF_TERM keys[] = {atom_beat, atom_bpm, atom_confidence, atom_onset, atom_bands};
-    ERL_NIF_TERM values[] = {beat ? atom_true : atom_false, s2l_make_double(env, bpm),
-                             s2l_make_double(env, confidence), onset ? atom_true : atom_false,
-                             bands};
+    ERL_NIF_TERM keys[] = {atom_beat,  atom_bpm,       atom_confidence,
+                           atom_onset, atom_bands,     atom_peak_freq,
+                           atom_peak_magnitude};
+    ERL_NIF_TERM values[] = {beat ? atom_true : atom_false,
+                             s2l_make_double(env, bpm),
+                             s2l_make_double(env, confidence),
+                             onset ? atom_true : atom_false,
+                             bands,
+                             s2l_make_double(env, peak_freq),
+                             s2l_make_double(env, peak_magnitude)};
     ERL_NIF_TERM result;
 
-    if (!enif_make_map_from_arrays(env, keys, values, 5, &result)) {
+    if (!enif_make_map_from_arrays(env, keys, values, 7, &result)) {
         return s2l_error(env, atom_init_failed);
     }
 
@@ -279,7 +356,7 @@ static ERL_NIF_TERM s2l_process(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 static ErlNifFunc nif_funcs[] = {
     /* Builds FFT plans and filter coefficients: milliseconds, not microseconds,
      * so it goes to a dirty scheduler. It is a setup-time call regardless. */
-    {"create", 6, s2l_create, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"create", 8, s2l_create, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"process", 2, s2l_process, 0},
 };
 

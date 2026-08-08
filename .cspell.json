@@ -41,6 +41,10 @@
     "fftw",
     "filterbank",
     "fledex",
+    "fmax",
+    "fmin",
+    "Freqmap",
+    "Freqwave",
     "fvec",
     "libaubio",
     "LDFLAGS",
@@ -55,6 +59,7 @@
     "statefulness",
     "unifex",
     "Wextra",
+    "WLED",
     "wphase"
   ]
 }

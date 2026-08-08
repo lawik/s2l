@@ -114,6 +114,89 @@ defmodule S2l.AubioTest do
     end
   end
 
+  describe "dominant peak" do
+    test "reports the frequency of a pure tone" do
+      for freq <- [110, 440, 1000, 2500, 6000] do
+        {:ok, analyzer} = Aubio.create(48_000)
+        frames = analyze(analyzer, tone(freq, 48_000, 24_000))
+
+        # Bins are ~47 Hz apart at this window, so anything close to this
+        # implies the sub-bin interpolation is working rather than the raw bin
+        # index being reported.
+        assert_in_delta List.last(frames).peak_freq,
+                        freq,
+                        5,
+                        "a #{freq} Hz tone was located badly"
+      end
+    end
+
+    test "prefers the louder of two tones" do
+      {:ok, analyzer} = Aubio.create(48_000)
+      quiet = tone(400, 48_000, 48_000, 0.1)
+      loud = tone(3000, 48_000, 48_000, 0.8)
+      mixed = mix(quiet, loud)
+
+      assert_in_delta List.last(analyze(analyzer, mixed)).peak_freq, 3000, 20
+    end
+
+    test "reports nothing rather than a spurious bin on silence" do
+      {:ok, analyzer} = Aubio.create(48_000)
+
+      frames = analyze(analyzer, :binary.copy(<<0.0::float-32-little>>, 48_000))
+
+      assert List.last(frames).peak_freq == 0.0
+      assert List.last(frames).peak_magnitude == 0.0
+    end
+
+    test "stays within the representable range for noise" do
+      {:ok, analyzer} = Aubio.create(48_000)
+
+      for frame <- analyze(analyzer, :crypto.strong_rand_bytes(48_000 * 4)) do
+        assert frame.peak_freq >= 0.0
+        assert frame.peak_freq <= 24_000.0
+        assert frame.peak_magnitude >= 0.0
+      end
+    end
+  end
+
+  describe "band frequency range" do
+    test "confines the bands to the requested range" do
+      # A 15 kHz tone is inside the default 40 Hz - 12 kHz window's stopband,
+      # so it should barely register, while 6 kHz sits inside it.
+      {:ok, narrow} = Aubio.create(48_000)
+      inside = analyze(narrow, tone(6000, 48_000, 24_000)) |> List.last()
+
+      {:ok, narrow2} = Aubio.create(48_000)
+      outside = analyze(narrow2, tone(15_000, 48_000, 24_000)) |> List.last()
+
+      assert Enum.sum(inside.bands) > 10 * Enum.sum(outside.bands)
+    end
+
+    test "widening the range lets high content back in" do
+      {:ok, wide} = Aubio.create(48_000, fmax: 20_000)
+
+      frame = analyze(wide, tone(15_000, 48_000, 24_000)) |> List.last()
+
+      assert Enum.sum(frame.bands) > 0.0
+      # Content above the mel range's midpoint must land in the upper bands.
+      {low, high} = Enum.split(frame.bands, 8)
+      assert Enum.sum(high) > Enum.sum(low)
+    end
+
+    test "rejects a range that cannot be built" do
+      assert {:error, :badarg} = Aubio.create(48_000, fmin: 1000, fmax: 500)
+      assert {:error, :badarg} = Aubio.create(48_000, fmin: 100, fmax: 100)
+      assert {:error, :badarg} = Aubio.create(48_000, fmin: -5)
+    end
+
+    test "clamps the default ceiling to Nyquist on a low-rate stream" do
+      # The 12 kHz default is above Nyquist here; it must be pulled down rather
+      # than rejected.
+      assert {:ok, analyzer} = Aubio.create(16_000)
+      assert analyzer.fmax == 8_000.0
+    end
+  end
+
   describe "robustness" do
     setup do
       {:ok, analyzer} = Aubio.create(44_100, hop_size: 512)
@@ -205,6 +288,22 @@ defmodule S2l.AubioTest do
       {:ok, analysis} = Aubio.process(analyzer, frame)
       analysis
     end
+  end
+
+  defp tone(freq, sample_rate, samples, amplitude \\ 0.5) do
+    for i <- 0..(samples - 1), into: <<>> do
+      <<amplitude * :math.sin(2 * :math.pi() * freq * i / sample_rate)::float-32-little>>
+    end
+  end
+
+  defp mix(left, right) do
+    samples = fn pcm -> for <<sample::float-32-little <- pcm>>, do: sample end
+
+    left
+    |> samples.()
+    |> Enum.zip_with(samples.(right), &+/2)
+    |> Enum.map(&<<&1::float-32-little>>)
+    |> IO.iodata_to_binary()
   end
 
   defp assert_well_formed(analysis, bands) do

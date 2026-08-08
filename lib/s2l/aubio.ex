@@ -33,7 +33,7 @@ defmodule S2l.Aubio do
 
   alias S2l.Aubio.Native
 
-  defstruct [:ref, :sample_rate, :buf_size, :hop_size, :bands]
+  defstruct [:ref, :sample_rate, :buf_size, :hop_size, :bands, :fmin, :fmax]
 
   @typedoc """
   A configured analyzer. Holds the aubio state; garbage collected like any
@@ -44,7 +44,9 @@ defmodule S2l.Aubio do
           sample_rate: pos_integer(),
           buf_size: pos_integer(),
           hop_size: pos_integer(),
-          bands: pos_integer()
+          bands: pos_integer(),
+          fmin: float(),
+          fmax: float()
         }
 
   @typedoc """
@@ -58,13 +60,21 @@ defmodule S2l.Aubio do
     more frequent.
   * `:bands` — energy per mel-spaced frequency band, low to high, all
     non-negative. This is the raw material for color.
+  * `:peak_freq` — frequency of the loudest spectral bin, in Hz, interpolated
+    between bins. `0.0` when the frame has no peak worth naming. This is a
+    dominant frequency, not a musical pitch: on a chord it reports the loudest
+    partial rather than a fundamental.
+  * `:peak_magnitude` — how strong that peak is, in the same arbitrary units as
+    `:bands`. Compare it against the band energies rather than a fixed number.
   """
   @type analysis :: %{
           beat: boolean(),
           bpm: float(),
           confidence: float(),
           onset: boolean(),
-          bands: [float()]
+          bands: [float()],
+          peak_freq: float(),
+          peak_magnitude: float()
         }
 
   @typedoc """
@@ -91,6 +101,11 @@ defmodule S2l.Aubio do
   @default_bands 16
   @default_onset_method :hfc
   @default_tempo_method :default
+  # Roughly the range music actually occupies: below 40 Hz is rumble, above
+  # 12 kHz is air and cymbal shimmer. Spending bands on 12-24 kHz, where there
+  # is almost nothing, leaves the top of the spread permanently dark.
+  @default_fmin 40.0
+  @default_fmax 12_000.0
 
   @doc """
   Creates an analyzer for a stream running at `sample_rate` Hz.
@@ -103,6 +118,12 @@ defmodule S2l.Aubio do
     `#{@default_hop_size}`). Sets how often analysis updates: at 44.1 kHz, 512
     samples is about 86 times a second.
   * `:bands` — number of mel bands (default `#{@default_bands}`).
+  * `:fmin` — lowest frequency covered by the bands, in Hz
+    (default `#{@default_fmin}`).
+  * `:fmax` — highest frequency covered, in Hz (default `#{@default_fmax}`,
+    clamped to Nyquist). Widening this to Nyquist spends most of the top bands
+    on frequencies music does not use, which leaves them dark and pulls any
+    statistic computed across the bands towards the middle.
   * `:onset_method` — see `t:method/0` (default `#{inspect(@default_onset_method)}`).
   * `:tempo_method` — detection function behind beat tracking (default
     `#{inspect(@default_tempo_method)}`).
@@ -120,17 +141,24 @@ defmodule S2l.Aubio do
     bands = Keyword.get(opts, :bands, @default_bands)
     onset_method = Keyword.get(opts, :onset_method, @default_onset_method)
     tempo_method = Keyword.get(opts, :tempo_method, @default_tempo_method)
+    fmin = opts |> Keyword.get(:fmin, @default_fmin) |> to_float()
+    # A default that assumes 48 kHz would be rejected outright on a device
+    # running at 8 kHz, so the ceiling follows the stream.
+    fmax = opts |> Keyword.get(:fmax, @default_fmax) |> to_float() |> min(sample_rate / 2)
 
     with {:ok, onset} <- method_name(onset_method),
          {:ok, tempo} <- method_name(tempo_method),
-         {:ok, ref} <- Native.create(sample_rate, buf_size, hop_size, bands, onset, tempo) do
+         {:ok, ref} <-
+           Native.create(sample_rate, buf_size, hop_size, bands, fmin, fmax, onset, tempo) do
       {:ok,
        %__MODULE__{
          ref: ref,
          sample_rate: sample_rate,
          buf_size: buf_size,
          hop_size: hop_size,
-         bands: bands
+         bands: bands,
+         fmin: fmin,
+         fmax: fmax
        }}
     end
   end
@@ -163,4 +191,7 @@ defmodule S2l.Aubio do
 
   defp method_name(method) when method in @methods, do: {:ok, Atom.to_string(method)}
   defp method_name(_method), do: {:error, :unknown_method}
+
+  defp to_float(value) when is_integer(value), do: value * 1.0
+  defp to_float(value), do: value
 end
