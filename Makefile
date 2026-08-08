@@ -76,8 +76,13 @@ AUBIO_BUILD_CFLAGS = -O2 -fPIC -std=c99 $(AUBIO_DEFS) -I$(AUBIO_SOURCE_DIR)/src
 CFLAGS ?= -O2 -Wall -Wextra
 CFLAGS += -std=c11 -fPIC -I$(ERTS_INCLUDE_DIR) -I$(AUBIO_SOURCE_DIR)/src
 
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
+# Shared-library flags follow the *target*, not the build host. `uname -s`
+# reports the host, so a macOS machine cross-compiling for a Linux device would
+# hand Darwin flags to a GNU linker, where `-dynamiclib` parses as a string of
+# one-letter debug options and `-undefined` sends ld hunting for a file named
+# `dynamic_lookup`. Asking the compiler what it targets is right either way.
+TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null)
+ifneq (,$(findstring darwin,$(TARGET_TRIPLE)))
 SO_LDFLAGS = -dynamiclib -undefined dynamic_lookup
 else
 SO_LDFLAGS = -shared
