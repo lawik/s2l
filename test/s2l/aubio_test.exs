@@ -1,0 +1,228 @@
+defmodule S2l.AubioTest do
+  use ExUnit.Case, async: true
+
+  alias S2l.Aubio
+  alias S2l.Test.ClickTrack
+
+  doctest S2l.Aubio
+
+  @bpm 120
+  @clicks 20
+  # The tempo tracker needs a few seconds of evidence before its estimate means
+  # anything, so beats are only counted after it has had them.
+  @lock_seconds 4
+
+  describe "create/2" do
+    test "builds an analyzer carrying its own configuration" do
+      assert {:ok, analyzer} = Aubio.create(44_100, hop_size: 256, buf_size: 1024, bands: 8)
+
+      assert %Aubio{sample_rate: 44_100, hop_size: 256, buf_size: 1024, bands: 8} = analyzer
+      assert is_reference(analyzer.ref)
+      assert Aubio.frame_size(analyzer) == 1024
+    end
+
+    test "rejects sizes aubio cannot work with" do
+      assert {:error, :badarg} = Aubio.create(0)
+      assert {:error, :badarg} = Aubio.create(44_100, hop_size: 0)
+      assert {:error, :badarg} = Aubio.create(44_100, bands: 0)
+      # A window shorter than the hop leaves the phase vocoder nothing to slide.
+      assert {:error, :badarg} = Aubio.create(44_100, buf_size: 256, hop_size: 512)
+    end
+
+    test "rejects unknown detection methods without reaching aubio" do
+      assert {:error, :unknown_method} = Aubio.create(44_100, onset_method: :nonsense)
+      assert {:error, :unknown_method} = Aubio.create(44_100, tempo_method: :nonsense)
+    end
+
+    test "accepts every documented onset method" do
+      for method <- [:default, :energy, :hfc, :complex, :phase, :specdiff, :kl, :mkl, :specflux] do
+        assert {:ok, _analyzer} = Aubio.create(44_100, onset_method: method),
+               "onset method #{method} failed to initialize"
+      end
+    end
+  end
+
+  describe "analysis of a 120 BPM click track" do
+    setup do
+      {:ok, analyzer} = Aubio.create(44_100)
+      frames = analyze(analyzer, ClickTrack.synth(bpm: @bpm, clicks: @clicks))
+
+      %{analyzer: analyzer, frames: frames}
+    end
+
+    test "locks onto the tempo", %{frames: frames} do
+      bpm = List.last(frames).bpm
+
+      assert_in_delta bpm, @bpm, 3
+    end
+
+    test "reports confidence in the tempo it found", %{frames: frames} do
+      assert List.last(frames).confidence > 0
+    end
+
+    test "fires an onset for nearly every click", %{frames: frames} do
+      onsets = Enum.count(frames, & &1.onset)
+
+      assert onsets >= 15, "only #{onsets} onsets detected across #{@clicks} clicks"
+    end
+
+    test "emits beats once the tempo tracker has locked", %{analyzer: analyzer, frames: frames} do
+      lock_frame = round(@lock_seconds * analyzer.sample_rate / analyzer.hop_size)
+
+      beats =
+        frames
+        |> Enum.drop(lock_frame)
+        |> Enum.count(& &1.beat)
+
+      assert beats >= 5, "only #{beats} beats after #{@lock_seconds}s of lock-in time"
+    end
+
+    test "produces one non-negative value per band", %{analyzer: analyzer, frames: frames} do
+      for frame <- frames do
+        assert length(frame.bands) == analyzer.bands
+        assert Enum.all?(frame.bands, &(&1 >= 0.0))
+      end
+    end
+
+    test "band energy tracks the clicks rather than the silence", %{frames: frames} do
+      {loud, quiet} = Enum.split_with(frames, & &1.onset)
+
+      assert mean_energy(loud) > 5 * mean_energy(quiet)
+    end
+  end
+
+  describe "sample rate handling" do
+    # A 48 kHz stream analyzed as if it were 44.1 kHz reports a BPM about 9%
+    # off and nothing else goes wrong, which is exactly why it is worth a test.
+    test "reads tempo correctly at 48 kHz" do
+      {:ok, analyzer} = Aubio.create(48_000)
+      pcm = ClickTrack.synth(sample_rate: 48_000, bpm: @bpm, clicks: @clicks)
+
+      frames = analyze(analyzer, pcm)
+
+      assert_in_delta List.last(frames).bpm, @bpm, 3
+      assert Enum.count(frames, & &1.onset) >= 15
+    end
+
+    test "the same audio analyzed at the wrong rate skews the tempo" do
+      {:ok, analyzer} = Aubio.create(44_100)
+      pcm = ClickTrack.synth(sample_rate: 48_000, bpm: @bpm, clicks: @clicks)
+
+      bpm = analyze(analyzer, pcm) |> List.last() |> Map.fetch!(:bpm)
+
+      assert_in_delta bpm, @bpm * 44_100 / 48_000, 4
+    end
+  end
+
+  describe "robustness" do
+    setup do
+      {:ok, analyzer} = Aubio.create(44_100, hop_size: 512)
+
+      %{analyzer: analyzer}
+    end
+
+    test "rejects frames that are not exactly one hop", %{analyzer: analyzer} do
+      frame_size = Aubio.frame_size(analyzer)
+
+      for size <- [0, 1, frame_size - 4, frame_size - 1, frame_size + 1, frame_size * 2] do
+        frame = :binary.copy(<<0>>, size)
+
+        assert {:error, :bad_frame_size} = Aubio.process(analyzer, frame),
+               "a #{size} byte frame was accepted"
+      end
+    end
+
+    test "survives random binaries of random lengths", %{analyzer: analyzer} do
+      for _ <- 1..500 do
+        frame = :crypto.strong_rand_bytes(Enum.random(0..4096))
+
+        case Aubio.process(analyzer, frame) do
+          {:ok, analysis} -> assert_well_formed(analysis, analyzer.bands)
+          {:error, :bad_frame_size} -> :ok
+        end
+      end
+    end
+
+    test "survives correctly sized frames of arbitrary bits", %{analyzer: analyzer} do
+      # Random bits reinterpreted as floats include NaN and infinities. These
+      # must come back as a well-formed result, not a badarg from building the
+      # return term and not a crashed VM.
+      for _ <- 1..200 do
+        frame = :crypto.strong_rand_bytes(Aubio.frame_size(analyzer))
+
+        assert {:ok, analysis} = Aubio.process(analyzer, frame)
+        assert_well_formed(analysis, analyzer.bands)
+      end
+    end
+
+    test "accepts frames that are unaligned sub-binaries", %{analyzer: analyzer} do
+      frame_size = Aubio.frame_size(analyzer)
+      # Offsetting by one byte inside a larger binary yields a frame whose data
+      # pointer is not float-aligned, which the NIF has to copy rather than
+      # alias.
+      padded = :binary.copy(<<0.25::float-32-little>>, 600)
+      unaligned = binary_part(padded, 1, frame_size)
+
+      assert {:ok, analysis} = Aubio.process(analyzer, unaligned)
+      assert_well_formed(analysis, analyzer.bands)
+    end
+
+    test "reclaims analyzers that go out of scope" do
+      for _ <- 1..200 do
+        {:ok, analyzer} = Aubio.create(44_100, buf_size: 128, hop_size: 64, bands: 8)
+        frame = :binary.copy(<<0.0::float-32-little>>, 64)
+
+        assert {:ok, _analysis} = Aubio.process(analyzer, frame)
+      end
+
+      :erlang.garbage_collect()
+
+      # Still usable afterwards: the destructor freed the dropped analyzers and
+      # nothing else.
+      assert {:ok, analyzer} = Aubio.create(44_100)
+      assert {:ok, _analysis} = Aubio.process(analyzer, silent_frame(analyzer))
+    end
+
+    test "keeps working when frames are fed from several processes" do
+      {:ok, analyzer} = Aubio.create(44_100)
+      frame = silent_frame(analyzer)
+
+      results =
+        1..8
+        |> Task.async_stream(fn _ ->
+          Enum.map(1..50, fn _ -> Aubio.process(analyzer, frame) end)
+        end)
+        |> Enum.flat_map(fn {:ok, results} -> results end)
+
+      assert Enum.all?(results, &match?({:ok, _analysis}, &1))
+    end
+  end
+
+  defp analyze(analyzer, pcm) do
+    frame_size = Aubio.frame_size(analyzer)
+
+    for <<frame::binary-size(^frame_size) <- pcm>> do
+      {:ok, analysis} = Aubio.process(analyzer, frame)
+      analysis
+    end
+  end
+
+  defp assert_well_formed(analysis, bands) do
+    assert is_boolean(analysis.beat)
+    assert is_boolean(analysis.onset)
+    assert is_float(analysis.bpm)
+    assert is_float(analysis.confidence)
+    assert length(analysis.bands) == bands
+    assert Enum.all?(analysis.bands, &is_float/1)
+  end
+
+  defp silent_frame(analyzer) do
+    :binary.copy(<<0.0::float-32-little>>, analyzer.hop_size)
+  end
+
+  defp mean_energy([]), do: 0.0
+
+  defp mean_energy(frames) do
+    Enum.sum(Enum.map(frames, &Enum.sum(&1.bands))) / length(frames)
+  end
+end

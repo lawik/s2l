@@ -1,8 +1,5 @@
 defmodule S2lTest do
-  use ExUnit.Case
-  doctest S2l
+  use ExUnit.Case, async: true
 
-  test "greets the world" do
-    assert S2l.hello() == :world
-  end
+  doctest S2l
 end
