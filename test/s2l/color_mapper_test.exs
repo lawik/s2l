@@ -321,6 +321,87 @@ defmodule S2l.ColorMapperTest do
     end
   end
 
+  describe "option validation" do
+    test "rejects values that would take the server down or peg a scheduler" do
+      mapper = start_mapper()
+
+      # div(1000, 0) on the next tick.
+      assert {:error, {:invalid_option, :fps, 0}} = ColorMapper.configure(mapper, fps: 0)
+      # div(1000, 2000) is 0, i.e. a zero-interval tick storm.
+      assert {:error, {:invalid_option, :fps, 2000}} = ColorMapper.configure(mapper, fps: 2000)
+      # Enum.take(list, -1) keeps the oldest frame rather than none.
+      assert {:error, {:invalid_option, :history, -1}} =
+               ColorMapper.configure(mapper, history: -1)
+
+      # Still alive and still ticking after all of that.
+      :ok = ColorMapper.subscribe(mapper)
+      assert_receive {:s2l_frame, _frame}, 500
+    end
+
+    test "rejects out-of-range and wrongly typed values" do
+      mapper = start_mapper()
+
+      assert {:error, {:invalid_option, :decay, 1.5}} = ColorMapper.configure(mapper, decay: 1.5)
+
+      assert {:error, {:invalid_option, :attack, -0.1}} =
+               ColorMapper.configure(mapper, attack: -0.1)
+
+      assert {:error, {:invalid_option, :fps, 30.5}} = ColorMapper.configure(mapper, fps: 30.5)
+
+      assert {:error, {:invalid_option, :hue_range, _}} =
+               ColorMapper.configure(mapper, hue_range: 5)
+
+      # A backwards range would make the span negative.
+      assert {:error, {:invalid_option, :hue_range, _}} =
+               ColorMapper.configure(mapper, hue_range: {300.0, 10.0})
+    end
+
+    test "rejects unknown keys instead of merging them silently" do
+      mapper = start_mapper()
+
+      assert {:error, {:unknown_option, :dcay}} = ColorMapper.configure(mapper, dcay: 0.1)
+    end
+
+    test "accepts integers where a float is expected" do
+      mapper = start_mapper()
+
+      assert :ok = ColorMapper.configure(mapper, beat_boost: 1, hue_range: {0, 200})
+    end
+
+    test "refuses to start with invalid options" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {:invalid_option, :fps, 0}} = ColorMapper.start_link(name: :bad_fps, fps: 0)
+    end
+  end
+
+  describe "subscribe/1" do
+    test "subscribing twice does not double up the frames" do
+      mapper = start_mapper(fps: 30)
+
+      :ok = ColorMapper.subscribe(mapper)
+      :ok = ColorMapper.subscribe(mapper)
+
+      assert_receive {:s2l_frame, _frame}, 500
+      # One tick delivers one frame, so nothing more should be waiting after
+      # draining the first.
+      refute_receive {:s2l_frame, _frame}, 10
+    end
+
+    test "unsubscribing after a double subscribe stops everything" do
+      mapper = start_mapper()
+
+      :ok = ColorMapper.subscribe(mapper)
+      :ok = ColorMapper.subscribe(mapper)
+      :ok = ColorMapper.unsubscribe(mapper)
+
+      Process.sleep(@tick_ms * 4)
+      flush_frames()
+
+      refute_receive {:s2l_frame, _frame}, 100
+    end
+  end
+
   describe "configure/2" do
     test "changes behaviour on a running mapper" do
       mapper = start_mapper(hue_range: {0.0, 100.0}, hue_smoothing: 1.0)

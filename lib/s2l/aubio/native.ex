@@ -7,10 +7,19 @@ defmodule S2l.Aubio.Native do
 
   @spec load_nif() :: :ok | {:error, term()}
   def load_nif() do
-    :s2l
-    |> :code.priv_dir()
-    |> :filename.join(~c"s2l_aubio_nif")
-    |> :erlang.load_nif(0)
+    # priv_dir/1 answers {:error, :bad_name} when the application is not
+    # visible, which an escript or a stripped release can produce. Matching it
+    # here fails the module load with a reason that names the problem, rather
+    # than a FunctionClauseError raised from inside :filename.join.
+    case :code.priv_dir(:s2l) do
+      {:error, reason} ->
+        {:error, {:priv_dir_unavailable, reason}}
+
+      dir ->
+        dir
+        |> :filename.join(~c"s2l_aubio_nif")
+        |> :erlang.load_nif(0)
+    end
   end
 
   @spec create(

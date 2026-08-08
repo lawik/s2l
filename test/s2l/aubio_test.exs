@@ -1,6 +1,8 @@
 defmodule S2l.AubioTest do
   use ExUnit.Case, async: true
 
+  import Bitwise
+
   alias S2l.Aubio
   alias S2l.Test.ClickTrack
 
@@ -27,6 +29,29 @@ defmodule S2l.AubioTest do
       assert {:error, :badarg} = Aubio.create(44_100, bands: 0)
       # A window shorter than the hop leaves the phase vocoder nothing to slide.
       assert {:error, :badarg} = Aubio.create(44_100, buf_size: 256, hop_size: 512)
+    end
+
+    test "refuses window sizes large enough to take the emulator down" do
+      # aubio allocates with an unchecked calloc, so a big enough window means
+      # a NULL data pointer written through, or a size_t overflow on 32-bit.
+      # Neither is catchable after the fact, so the size never reaches aubio.
+      assert {:error, :badarg} = Aubio.create(44_100, buf_size: 1 <<< 27, hop_size: 1 <<< 27)
+      assert {:error, :badarg} = Aubio.create(44_100, buf_size: 1 <<< 30, hop_size: 512)
+      assert {:error, :badarg} = Aubio.create(44_100, buf_size: 65_536, hop_size: 512)
+    end
+
+    test "allows windows up to the cap" do
+      assert {:ok, _analyzer} = Aubio.create(44_100, buf_size: 16_384, hop_size: 512)
+    end
+
+    test "rejects non-power-of-two windows quietly" do
+      # The bundled ooura FFT only takes powers of two. Caught before aubio so
+      # the failure is a plain badarg rather than three AUBIO ERROR lines on
+      # stderr, which on a device land on the console.
+      for buf_size <- [1000, 1023, 1025, 3000] do
+        assert {:error, :badarg} = Aubio.create(44_100, buf_size: buf_size, hop_size: 256),
+               "a #{buf_size} sample window was accepted"
+      end
     end
 
     test "rejects unknown detection methods without reaching aubio" do
@@ -236,6 +261,24 @@ defmodule S2l.AubioTest do
         assert {:ok, analysis} = Aubio.process(analyzer, frame)
         assert_well_formed(analysis, analyzer.bands)
       end
+    end
+
+    test "serializes unaligned frames from several processes", %{analyzer: analyzer} do
+      # The unaligned path copies into a scratch buffer shared by every caller.
+      # Copying outside the lock lets one process overwrite the frame another
+      # is mid-analysis on, so the copy has to be inside it.
+      frame_size = Aubio.frame_size(analyzer)
+      padded = :binary.copy(<<0.25::float-32-little>>, frame_size + 8)
+      unaligned = binary_part(padded, 1, frame_size)
+
+      results =
+        1..8
+        |> Task.async_stream(fn _ ->
+          Enum.map(1..100, fn _ -> Aubio.process(analyzer, unaligned) end)
+        end)
+        |> Enum.flat_map(fn {:ok, results} -> results end)
+
+      assert Enum.all?(results, &match?({:ok, _analysis}, &1))
     end
 
     test "accepts frames that are unaligned sub-binaries", %{analyzer: analyzer} do

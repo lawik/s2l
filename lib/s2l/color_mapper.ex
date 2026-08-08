@@ -128,6 +128,36 @@ defmodule S2l.ColorMapper do
     gate: 1.0e-6
   }
 
+  # `configure/2` is advertised as the live tuning loop, so bad values get typed
+  # at a running server rather than caught in review. Several are load-bearing:
+  # `fps: 0` divides by zero on the next tick and takes the server down with the
+  # subscriptions and all the adaptation state; `fps: 2000` makes the tick
+  # interval 0 and pegs a scheduler; `history: -1` makes `Enum.take/2` keep the
+  # *oldest* frame instead of none.
+  @bounds %{
+    fps: {:integer, 1, 240},
+    attack: {:number, 0.0, 1.0},
+    decay: {:number, 0.0, 1.0},
+    hue_smoothing: {:number, 0.0, 1.0},
+    hue_adapt: {:number, 0.0, 1.0},
+    hue_min_span: {:number, 0.001, 1.0},
+    pitch_smoothing: {:number, 0.0, 1.0},
+    beat_boost: {:number, 0.0, 1.0},
+    beat_decay: {:number, 0.0, 1.0},
+    gain_decay: {:number, 0.0, 1.0},
+    peak_decay: {:number, 0.0, 1.0},
+    gate: {:number, 0.0, 1.0},
+    history: {:integer, 0, 100_000},
+    hue_range: :range,
+    pitch_range: :range
+  }
+
+  # Keeps the two tables from drifting apart as options are added.
+  @untyped Map.keys(@defaults) -- Map.keys(@bounds)
+  if @untyped != [] do
+    raise "S2l.ColorMapper options without validation bounds: #{inspect(@untyped)}"
+  end
+
   @doc """
   Starts a color mapper.
 
@@ -172,6 +202,12 @@ defmodule S2l.ColorMapper do
 
       S2l.ColorMapper.configure(decay: 0.05, beat_boost: 0.8)
 
+  Options are validated rather than clamped, so a value outside its range comes
+  back as `{:error, {:invalid_option, key, value}}` and an unrecognised key as
+  `{:error, {:unknown_option, key}}`, both leaving the running configuration
+  untouched. Being told is more useful than a silently adjusted number when the
+  point of the call is to hear the difference.
+
   ## Options
 
   * `:fps` — frames emitted per second (default `#{@defaults.fps}`).
@@ -199,9 +235,9 @@ defmodule S2l.ColorMapper do
   * `:history` — frames retained for `history/1` (default `#{@defaults.history}`,
     three seconds at the default rate). `0` disables it.
   """
-  @spec configure(GenServer.server(), [option()]) :: :ok
+  @spec configure(GenServer.server(), [option()]) :: :ok | {:error, term()}
   def configure(server \\ __MODULE__, opts) do
-    GenServer.call(server, {:configure, Map.new(opts)})
+    GenServer.call(server, {:configure, opts})
   end
 
   @doc """
@@ -231,8 +267,15 @@ defmodule S2l.ColorMapper do
 
   @impl GenServer
   def init(opts) do
+    case validate(opts) do
+      {:ok, config} -> {:ok, start_state(Map.merge(@defaults, config))}
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  defp start_state(config) do
     state = %{
-      config: Map.merge(@defaults, Map.new(opts)),
+      config: config,
       level: 0.0,
       hue: 0.0,
       spike: 0.0,
@@ -251,7 +294,7 @@ defmodule S2l.ColorMapper do
       subscribers: %{}
     }
 
-    {:ok, schedule_tick(state)}
+    schedule_tick(state)
   end
 
   @impl GenServer
@@ -261,9 +304,13 @@ defmodule S2l.ColorMapper do
 
   @impl GenServer
   def handle_call({:subscribe, pid}, _from, state) do
-    ref = Process.monitor(pid)
-
-    {:reply, :ok, put_in(state.subscribers[ref], pid)}
+    # Subscribing twice from one process would otherwise deliver every frame
+    # twice, and a LiveView remounting on reconnect makes that easy to hit.
+    if Enum.any?(state.subscribers, fn {_ref, subscriber} -> subscriber == pid end) do
+      {:reply, :ok, state}
+    else
+      {:reply, :ok, put_in(state.subscribers[Process.monitor(pid)], pid)}
+    end
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do
@@ -276,7 +323,10 @@ defmodule S2l.ColorMapper do
   end
 
   def handle_call({:configure, opts}, _from, state) do
-    {:reply, :ok, %{state | config: Map.merge(state.config, opts)}}
+    case validate(opts) do
+      {:ok, changes} -> {:reply, :ok, %{state | config: Map.merge(state.config, changes)}}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:frame, _from, state) do
@@ -496,4 +546,40 @@ defmodule S2l.ColorMapper do
   end
 
   defp clamp(value, low, high), do: value |> max(low) |> min(high)
+
+  # Rejects rather than clamps: a value outside its range is a mistake, and
+  # silently moving it makes the tuning loop lie about what is running.
+  defp validate(opts) do
+    Enum.reduce_while(opts, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      case validate_option(key, value) do
+        {:ok, checked} -> {:cont, {:ok, Map.put(acc, key, checked)}}
+        :invalid -> {:halt, {:error, {:invalid_option, key, value}}}
+        :unknown -> {:halt, {:error, {:unknown_option, key}}}
+      end
+    end)
+  end
+
+  defp validate_option(key, value) do
+    case Map.fetch(@bounds, key) do
+      :error -> :unknown
+      {:ok, bound} -> check(bound, value)
+    end
+  end
+
+  defp check(:range, {low, high}) when is_number(low) and is_number(high) and high > low do
+    {:ok, {low * 1.0, high * 1.0}}
+  end
+
+  defp check({:integer, low, high}, value)
+       when is_integer(value) and value >= low and value <= high do
+    {:ok, value}
+  end
+
+  # Integers are accepted wherever a float is wanted, so `beat_boost: 1` works.
+  defp check({:number, low, high}, value)
+       when is_number(value) and value >= low and value <= high do
+    {:ok, value * 1.0}
+  end
+
+  defp check(_bound, _value), do: :invalid
 end

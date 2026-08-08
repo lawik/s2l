@@ -106,6 +106,8 @@ defmodule S2l.Aubio do
   # is almost nothing, leaves the top of the spread permanently dark.
   @default_fmin 40.0
   @default_fmax 12_000.0
+  # Mirrors S2L_MAX_BUF_SIZE in c_src/s2l_aubio_nif.c, where it is enforced.
+  @max_buf_size 16_384
 
   @doc """
   Creates an analyzer for a stream running at `sample_rate` Hz.
@@ -113,7 +115,10 @@ defmodule S2l.Aubio do
   ## Options
 
   * `:buf_size` — analysis window, in samples (default `#{@default_buf_size}`).
-    Must be at least `:hop_size`.
+    Must be a power of two, at least `:hop_size`, and no larger than
+    `#{@max_buf_size}`. The power-of-two requirement comes from the bundled FFT;
+    the ceiling keeps one call's work inside what a normal scheduler should be
+    given, and keeps window sizes away from allocations aubio does not check.
   * `:hop_size` — samples per call to `process/2` (default
     `#{@default_hop_size}`). Sets how often analysis updates: at 44.1 kHz, 512
     samples is about 86 times a second.

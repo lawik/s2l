@@ -25,6 +25,20 @@ typedef char s2l_smpl_is_float[(sizeof(smpl_t) == sizeof(float)) ? 1 : -1];
 #define S2L_MAX_BANDS 512
 #define S2L_MAX_METHOD_LEN 32
 
+/* aubio allocates with `calloc((n) * sizeof(t), 1)` and never checks the
+ * result: new_fvec hands back a non-NULL struct wrapping a NULL data pointer,
+ * and the window setup writes coefficients straight through it. So a large
+ * enough window segfaults the emulator inside create, and on 32-bit targets
+ * the multiply can wrap size_t into a small successful allocation that aubio
+ * then writes gigabytes through. NULL-checking aubio's constructors cannot
+ * catch either case, because the failure is never propagated.
+ *
+ * The ceiling also bounds process/2, which runs an FFT of this size on a
+ * normal scheduler: ~20 us at the default 1024 and ~0.5 ms here, against a
+ * 1 ms guideline. Anything larger belongs on a dirty scheduler, and no audio
+ * analysis window needs it. */
+#define S2L_MAX_BUF_SIZE 16384
+
 static ErlNifResourceType *s2l_analyzer_type = NULL;
 
 static ERL_NIF_TERM atom_ok;
@@ -171,13 +185,12 @@ static double s2l_peak_frequency(const s2l_analyzer *a, double *magnitude)
     return (peak + offset) * (double)a->sample_rate / (double)a->buf_size;
 }
 
-static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
+/* Shared by load and upgrade. A reloaded library gets fresh statics, so the
+ * resource type and the cached atoms both have to be established again. */
+static int s2l_init(ErlNifEnv *env, ErlNifResourceFlags flags)
 {
-    (void)priv_data;
-    (void)load_info;
-
-    s2l_analyzer_type = enif_open_resource_type(env, NULL, "s2l_analyzer", s2l_analyzer_dtor,
-                                                ERL_NIF_RT_CREATE, NULL);
+    s2l_analyzer_type =
+        enif_open_resource_type(env, NULL, "s2l_analyzer", s2l_analyzer_dtor, flags, NULL);
 
     if (!s2l_analyzer_type) {
         return 1;
@@ -201,6 +214,28 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     return 0;
 }
 
+static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
+{
+    (void)priv_data;
+    (void)load_info;
+
+    return s2l_init(env, ERL_NIF_RT_CREATE);
+}
+
+/* Without this, reloading the module — a recompile in a live iex session, or a
+ * release hot upgrade — fails the second load_nif and leaves every function
+ * raising :nif_not_loaded. TAKEOVER adopts the existing resource type so
+ * analyzers created by the previous version stay usable. */
+static int on_upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data,
+                      ERL_NIF_TERM load_info)
+{
+    (void)priv_data;
+    (void)old_priv_data;
+    (void)load_info;
+
+    return s2l_init(env, ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
+}
+
 static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     unsigned int sample_rate, buf_size, hop_size, n_bands;
@@ -221,11 +256,16 @@ static ERL_NIF_TERM s2l_create(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 
     /* aubio's pvoc needs a window at least as long as the hop, and both sizes
      * feed FFT plans, so bad values are rejected here rather than surfacing as
-     * aubio's own stderr complaints plus a NULL. */
-    if (sample_rate == 0 || hop_size == 0 || buf_size < hop_size || n_bands == 0 ||
-        n_bands > S2L_MAX_BANDS || onset_method.size == 0 ||
-        onset_method.size > S2L_MAX_METHOD_LEN || tempo_method.size == 0 ||
-        tempo_method.size > S2L_MAX_METHOD_LEN) {
+     * aubio's own stderr complaints plus a NULL.
+     *
+     * The bundled ooura FFT takes only power-of-two windows. Checking that here
+     * turns three AUBIO ERROR lines on stderr — which on a device land on the
+     * console — into a plain badarg. buf_size >= hop_size then bounds the hop
+     * along with the window. */
+    if (sample_rate == 0 || hop_size == 0 || buf_size < hop_size || buf_size > S2L_MAX_BUF_SIZE ||
+        (buf_size & (buf_size - 1)) != 0 || n_bands == 0 || n_bands > S2L_MAX_BANDS ||
+        onset_method.size == 0 || onset_method.size > S2L_MAX_METHOD_LEN ||
+        tempo_method.size == 0 || tempo_method.size > S2L_MAX_METHOD_LEN) {
         return s2l_error(env, atom_badarg);
     }
 
@@ -303,6 +343,11 @@ static ERL_NIF_TERM s2l_process(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     fvec_t in;
     in.length = a->hop_size;
 
+    /* Locked before the copy below, not just around the analysis: scratch is
+     * shared by every caller, so copying into it outside the lock lets a second
+     * process overwrite the frame a first process is still analyzing. */
+    enif_mutex_lock(a->lock);
+
     /* Sub-binaries can start at any byte offset, and aubio may hand the data to
      * vectorized code, so an unaligned frame is copied instead of aliased. */
     if (((uintptr_t)samples.data % sizeof(smpl_t)) == 0) {
@@ -311,8 +356,6 @@ static ERL_NIF_TERM s2l_process(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         memcpy(a->scratch->data, samples.data, samples.size);
         in.data = a->scratch->data;
     }
-
-    enif_mutex_lock(a->lock);
 
     aubio_tempo_do(a->tempo, &in, a->tempo_out);
     aubio_onset_do(a->onset, &in, a->onset_out);
@@ -360,4 +403,4 @@ static ErlNifFunc nif_funcs[] = {
     {"process", 2, s2l_process, 0},
 };
 
-ERL_NIF_INIT(Elixir.S2l.Aubio.Native, nif_funcs, on_load, NULL, NULL, NULL)
+ERL_NIF_INIT(Elixir.S2l.Aubio.Native, nif_funcs, on_load, NULL, on_upgrade, NULL)
